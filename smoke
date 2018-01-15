@@ -1,0 +1,536 @@
+#!/usr/bin/env python
+
+# Smoke - A unified means of generating, transmitting, encapsulating, and
+# validating multiple hash digests simultaneously to replace existing
+# stand-alone hash digest software.
+# 
+# Author:	Jay Ball / www.veggiespam.com / @veggiespam
+# License:	Apache v2
+# Whitepaper & Annoucement: https://veggiespam.com/smoke-announce/
+# Version:	0.8-beta-1
+#
+# For README, usage, and help, please see the repo at
+# https://github.com/veggiespam/smoke .  
+#
+
+global_version  = "0.8-beta-1"
+
+import hashlib
+import argparse                                                                 
+import zlib
+import binascii
+import re
+import sys
+import string
+
+#from multiprocessing import Pool
+import threading
+
+global_use_algs =[]
+
+class Smoke:
+	filename = None
+	hash_dict = { }
+	hash_finalizations = { }
+	hash_list_defaults = ['md5', 'sha512', 'sha1']
+	use_algs = [ ]
+
+	# TODO someone smarter than me should write a "mini-crc32" wrapper class.  It
+	# must save the state, have an update, and have the same interface as the
+	# other hash alg functions from hashlib, so: 
+	# start ==> self.crc32 = 0
+	# update ==> self.crc32 = zlib.crc32(data, self.crc32) & 0xffffffff
+	# finalize ==> no-op
+	# hexdigest ==> return "crc32=%08x " % (self.crc32)
+	
+
+	def __init__(self):
+		self.hash_finalizations = { }
+		self.hash_list_defaults = ['md5', 'sha512', 'sha1']
+		self.use_algs = self.hash_list_defaults
+		self.hash_dict = { }
+		self.smoke_sums_filename = "SMOKESUMS"
+
+	@staticmethod
+	def normalize_alg_name(name):
+		k=name.lower()
+		k=k.translate(None, " _-")
+		# TODO what about algs with parens, some appear in on systems, strip?
+		return k
+
+	@staticmethod
+	def algorithms_available():
+		a = [ ]
+		for s in hashlib.algorithms_available:
+			a.append(Smoke.normalize_alg_name(s))
+		b = list(set(a))
+		b.sort()
+		if 'sha' in b: b.remove('sha')
+		return b
+
+	def __str__(self):
+		ret = "{DIGESTS: "
+		# TODO add key/val == None errro checks.
+		for (key,val) in self.hash_dict.items():
+			ret = ret + key + "=" + val.hexdigest() + " "
+		ret = ret + "     FINALIZATIONS: " 
+		for (key,val) in self.hash_finalizations.items():
+			ret = ret + key + "=" + val + " "
+		ret = ret + 'filename=' + self.filename
+		ret = ret + '}'
+		return ret
+
+	def set_file_name(self,filename):
+		self.filename = filename
+
+	### Basic hashing stuff.  
+	### You start.  You update.  You finalize
+	###
+
+	def start(self):
+		for alg in self.use_algs:
+			#print "#DEBUG: loading alg " + alg
+			self.hash_dict[alg] = hashlib.new(alg)
+
+	def update_threaded(self,data):
+		# poor man's threading.  there are betters ways.
+		# TODO: make a pool at the process level to remove all
+		# the thread clone startup time that happens for each file.
+		mypool = [];
+		for h in self.hash_dict.viewvalues():
+			t = threading.Thread(target=h.update, args=(data,))
+			t.start()
+			mypool.append(t)
+		for t in mypool:
+			t.join()
+
+	def update_nonthread(self,data):
+		# non-threaded update : slower.
+		for h in self.hash_dict.viewvalues():
+			h.update(data)
+
+	def update(self,data):
+		return self.update_threaded(data)
+
+
+	def finalize(self):
+		for (key,val) in self.hash_dict.items():
+			self.hash_finalizations[key] = val.hexdigest()
+
+	### End basic hashing stuff.  
+	###
+
+	#  legacy, unused.  We decided single-line output was the way to go. 
+	def multi_line_digest(self):
+		ret = ""
+		fname = "\t-"
+		if self.filename != None:
+			fname = "\t" + self.filename
+		for h in self.hash_finalizations.viewkeys():
+			ret = ret + h + "\t" + self.hash_finalizations[h] + fname + "\n"
+		ret = ret[:-1]		# eat last \n
+		return ret
+
+	def single_line_digest(self):
+		ret = ""
+		fname = "\t-"
+		if self.filename != None:
+			fname = "\t" + self.filename
+		for h in self.hash_finalizations.viewkeys():
+			ret = ret + h + "=" + self.hash_finalizations[h] + ";"
+		ret = ret[:-1]		# eat last ;
+		ret = ret + fname
+		return ret
+
+	# Write a filename.smoke
+	def smoke_per_file(self):
+		ret = ""
+		sum_fname = self.filename + "." + "smoke"
+		val = self.single_line_digest() + "\n"
+		fp = open(sum_fname, 'wt')
+		fp.write(val)
+		fp.close()
+		return ret
+
+	# Appends SMOKESUMS digest file
+	def write_to_smoke_sums_digest_file(self):
+		ret = ""
+		sum_fname = self.smoke_sums_filename
+		fp = open(sum_fname, 'at')
+		line = self.single_line_digest() + "\n"
+		fp.write(line)
+		fp.close()
+		return ret
+
+	# Creates the empty SMOKESUMS file.  This has the desired side-effect
+	# of deleting an existing files if they exist.
+	def create_empty_smoke_sums_digest_file(self):
+		ret = ""
+		sum_fname = self.smoke_sums_filename
+		fp = open(sum_fname, 'w')
+		fp.close()
+		return ret
+
+
+	# Write a filename.md5, filename.sha1 file.
+	def digest_per_file(self):
+		ret = ""
+		for h in self.hash_finalizations.viewkeys():
+			sum_fname = self.filename + "." + h
+			val = self.hash_finalizations[h] + "\n"
+			fp = open(sum_fname, 'wt')
+			fp.write(val)
+			fp.close()
+		return ret
+
+
+	# Creates the empty MD5SUMS, SHA1SUMS files.  This has the desired side-effect
+	# of deleting an existing files if they exist.
+	def create_empty_multiple_sums_digests(self):
+		ret = ""
+		for h in self.hash_finalizations.viewkeys():
+			sum_fname = h.upper() + "SUMS"
+			fp = open(sum_fname, 'w')
+			fp.close()
+		return ret
+
+	def multiple_sums_digests(self):
+		ret = ""
+		for h in self.hash_finalizations.viewkeys():
+			fname = "\t-"
+			if self.filename != None:
+				fname = "\t" + self.filename
+			sum_fname = h.upper() + "SUMS"
+			val = self.hash_finalizations[h] + fname + "\n"
+			fp = open(sum_fname, 'at')
+			fp.write(val)
+			fp.close()
+		return ret
+
+
+	@staticmethod
+	def compare(yours, theirs):
+		y = yours.hash_finalizations
+		t = theirs.hash_finalizations
+		matches = {}
+		diffs = {}
+		missing = {}
+
+		# Check all keys in y dict
+		for key in y.keys():
+			if (not t.has_key(key)):
+				missing[key] = key
+			elif (y[key] != t[key]):
+				diffs[key] = (y[key], t[key])
+			else:
+				matches[key] = key
+		# Check all keys in t dict to find missing
+		for key in t.keys():
+			if (not y.has_key(key)):
+				missing[key] = key
+		return (diffs, matches, missing)
+
+
+
+	@staticmethod
+	def smoke_this_filepointer(fp):
+		buffsize = 1024 * 1024
+		s = Smoke()
+		s.use_algs = global_use_algs
+		s.start()
+		s.set_file_name(fp.name)
+		realbuff = bytearray(buffsize)
+		buff = memoryview(realbuff)
+		while True:
+			bytes_read = fp.readinto(buff)
+			if bytes_read == buffsize:
+				s.update(buff)
+				continue
+			if bytes_read != buffsize:
+				# TODO: edge case to test: what if filesize is exact multiple of buffsize?  slice[0:0] ?
+				# for the last block of data, we do a slice so as to not send a giant buffer full of randoms or nulls
+				s.update(buff[0:bytes_read])
+				break 
+		fp.close()
+		s.finalize()
+		return s
+
+	# in theory, this should be slower from all the string copying.  it isn't though...
+	@staticmethod
+	def smoke_this_filepointer_STRING_VERSION(fp):
+		buffsize = 1024 * 1024
+		s = Smoke()
+		s.use_algs = global_use_algs
+		s.start()
+		s.set_file_name(fp.name)
+		while True:
+			buff = fp.read(buffsize)
+			s.update(buff)
+			if len(buff) != buffsize:
+				break 
+		fp.close()
+		s.finalize()
+		return s
+
+	@staticmethod
+	def smoke_this_filename(filename):
+		fp = open(filename, 'rb')
+		return Smoke.smoke_this_filepointer(fp)
+
+	# Loads a text blob into an array of smoke structs
+	# ret[file1] = Smoke
+	# ret[file2] = Smoke2 ... etc.
+	@staticmethod
+	def get_digests_from_text_blob(text_blob):
+		lines = text_blob.splitlines()
+		list_of_lines = [ ] 
+
+		if 0:    # this does multi-line smoke imports.  We decided to not do this.
+			#  (?!(\w+)\s)*
+			pattern = re.compile("^(\S*)\s*(\S*)\s*(.*)$")
+			for l in lines:
+				if len(l) < 1:
+					continue
+				if l[0] == '#':
+					continue
+				# ignore lines with whitespace
+				# ignore lines with wrong number of fields
+				split = pattern.findall(l)[0]
+				list_of_lines.append(split)
+
+			#print list_of_lines
+
+			# figure out how to sort the list here by the fn, this way, you
+			# the logic below stays simple and you don't have to test for 
+			# if s_s[fn] . smoke exists...
+
+			smoke_stack = { } 
+			current_file = None
+			for l in list_of_lines:
+				alg = l[0]
+				hd = l[1]
+				fn = l[2]
+				if current_file != fn:
+					current_file = fn
+					smoke_stack[fn] = Smoke()
+					smoke_stack[fn].set_file_name(fn)
+				smoke_stack[fn].hash_finalizations[alg] = hd
+
+
+		# this is where we break it apart from a single-line-semi-colon; file type
+		# a smarter person could do a pattern which does everything at once, let them please.
+		pattern = re.compile("^\s*(\S*)\s*(.*)$")
+		for l in lines:
+			if len(l) < 1:
+				continue
+			if l[0] == '#':
+				continue
+			# ignore lines with whitespace
+			# ignore lines with wrong number of fields
+			split = pattern.findall(l)[0]
+			list_of_lines.append(split)
+
+		smoke_stack = { } 
+		for l in list_of_lines:
+			all_algs_hash = l[0]
+			fn = l[1]
+			smoke_stack[fn] = Smoke()
+			smoke_stack[fn].set_file_name(fn)
+			for A_HD in all_algs_hash.split(';'):
+				k=string.strip(A_HD, " ")
+				(alg, hd) = k.split('=')
+				smoke_stack[fn].hash_finalizations[alg] = hd
+
+		# at this point, the smoke_stack contains the hashes of the file computed before.  Thus, 
+		# time to see if our hashes match.
+
+		return smoke_stack
+
+	@staticmethod
+	def get_digests_from_filepointer(fp):
+		return Smoke.get_digests_from_text_blob(fp.read())
+
+
+	@staticmethod
+	def validate(smoke_stack):
+		fails = 0
+		for (filename, comp) in smoke_stack.viewitems():
+			s = Smoke.smoke_this_filename(filename)
+			(diffs, matches, missing) = Smoke.compare(s, comp)
+
+			if len(diffs) > 0:
+				fails = fails + 1
+				print filename + ": FAILED"
+				print "#WARN: DIFFS" , diffs
+			
+			if len(missing) > 0:
+				print "#WARN: hashes not computed for: ", missing
+
+			if len(matches) > 0:
+				print "#INFO: hashes matching: ", matches
+
+		return fails
+
+
+
+parser = argparse.ArgumentParser(description='Smoke - A unified means of generating and validating hash digests.  Author: Jay Ball @veggiespam.  Command line arguments are beta and subject to change.')
+
+group_gen = parser.add_argument_group('Hash generation destinations', description='Results are sent to stdout by default; can send to specified multiple destinations, both files and stdout')
+group_gen.add_argument('--stdout', help='Output smoked hash for all files to stdout', action='store_true')
+group_gen.add_argument('--smoke-file', help='Save smoked hash to single sums file, SMOKESUMS', action='store_true')
+group_gen.add_argument('--smoke-file-name', help='Name of smoked hash file, default SMOKESUMS', type=str, dest='smoke_file_name')
+group_gen.add_argument('--digest-per-file', help='Output digests per file, filename.md5, filename.sha1, etc', action='store_true')
+group_gen.add_argument('--multiple-smokes', help='Output a smoke for each file, filename1.smoke, filename2.smoke', action='store_true')
+group_gen.add_argument('--multiple-sums-digests', help='Output multiple digest summaries per algorithm, SHA1SUMS, MD5SUMS, etc.', action='store_true')
+group_gen.add_argument('--hash-hashed-files', help='Normally, SMOKESUMS, f.smoke, MD5SUMS, f.md5, f.sha1, etc are ignored; this hashes them anyway', action='store_true', default=False)
+
+#multi_or_single = group_gen.add_mutually_exclusive_group()
+#multi_or_single.add_argument('--single-line-smoke', help='separate hashes by semicolons: sha1=abc;md5=def (tab) filename', action='store_true')
+#multi_or_single.add_argument('--multi-line-smoke', help='separate hashes on lines: sha1 (tab) abc (tab) filename (NL)', action='store_true')
+
+
+group_val = parser.add_argument_group('Hash validation')
+
+group_val.add_argument('--ignore-unknown-algs', help='ignore unknown algs in SUMS file or command line', default=False, action="store_true")
+group_val.add_argument('-c', '--check', help='check file to validate against or "-" for stdin', type=argparse.FileType('rb'), dest='checkfile')
+group_val.add_argument('--debug', help='debug info to stderr', default=False, action="store_true")
+group_val.add_argument('--verbose', help='verbose info to stderr', default=False, action="store_true")
+
+
+group_all = parser.add_argument_group('Options for both')
+
+group_all.add_argument('--show-algs', help='Show all supported algorithms and exit', default=False, action="store_true")
+group_all.add_argument('--show-defaults', help='Show default used algorithms and exit', default=False, action="store_true")
+group_all.add_argument('-O', '--use-only-algs', help='Only use algs specified with --use-algs, do not append defaults', default=False, action="store_true")
+group_all.add_argument('-a', '--use-algs', help='Algorithms to use, appends to defaults unless --use-only-algs is present', type=str, action="append")
+group_all.add_argument('--version', action='version', version='%(prog)s ' + global_version )
+group_all.add_argument('--print-config', help='Print debug configuration and exit', default=False, action="store_true")
+# group_all.add_argument('--disk-buffer', help='Buffer size in MiB when reading files (def=1MiB)', type=int, default=1)
+group_all.add_argument('files', help='Files to smoke', type=argparse.FileType('rb'), nargs="*")
+
+args = parser.parse_args()
+
+if args.show_algs:
+	print Smoke.algorithms_available()
+	sys.exit(0)
+if args.show_defaults:
+	print Smoke.hash_list_defaults
+	sys.exit(0)
+
+
+# normalize the use_algs.  -a md5 -a sha1,sha256 ==> list [md5, sha1, sha256]
+global_use_algs =[]
+if args.use_only_algs == False:
+	global_use_algs = Smoke.hash_list_defaults
+#else:
+	#print "#DEBUG: useuse_only_algs detected"
+
+if args.use_algs != None:
+	for j in args.use_algs:
+		for orig in j.split(','):
+			k=Smoke.normalize_alg_name(orig)
+
+			if k in Smoke.algorithms_available():
+				global_use_algs.append(k)
+				#print "#DEBUG: added alg: " + k
+			elif args.ignore_unknown_algs != True:
+				print "#WARN: Ignoring unsupport algorithm '" + orig + "'"
+
+if len(global_use_algs) < 1:
+	print "FATAL: No supported alorithms specified"
+	sys.exit(1)
+if len(global_use_algs) == 1:
+	print "#WARN: Only one algorithm specified"
+
+# maybe test for at least one "strong" hash here.
+
+if args.print_config:
+	print '#' , args
+	sys.exit(0)
+
+# have we speficied any destination, if not, explicitly set stdout
+if True == args.smoke_file or True == args.smoke_file_name or True == args.digest_per_file or True == args.multiple_smokes or True == args.multiple_sums_digests or True == args.hash_hashed_files or True == args.stdout:
+	None #no-op.
+else:
+	args.stdout = True
+
+
+#  if -c is set, we are in "checksum validate" mode.  
+
+if args.checkfile != None:
+	smoke_stack = Smoke.get_digests_from_filepointer(args.checkfile)
+	args.checkfile.close()
+	# add global_use_algs here...
+	ret = Smoke.validate(smoke_stack)
+	sys.exit(ret)
+
+smoke_sums_fname = "SMOKESUMS"
+
+
+if None != args.smoke_file_name:
+	smoke_sums_fname = args.smoke_file_name
+
+
+
+file_list = []
+stdin = False
+if len(args.files) == 0:
+	stdin = True
+	file_list.append(sys.stdin)
+else:
+	file_list = args.files
+
+written = False		; # have we written results somewhere yet
+files_hashed = 0
+
+for fp in file_list:
+	ignored_extensions = ['SUMS']  ; # yes, we mean "SUMS" and not ".SUMS"
+	for i in Smoke.algorithms_available():
+		# TODO : some algs contain dashes...
+		ignored_extensions.append( "." + i )
+	if args.hash_hashed_files == False and (
+			fp.name.endswith(tuple(ignored_extensions))   ):
+		# also, skip single-digest-file-name SMOKE_FILE
+		print "#INFO: ignoring sum file:", fp.name
+		fp.close()
+		continue
+
+	s = Smoke.smoke_this_filepointer(fp)
+	fp.close()
+
+
+	if True == stdin:
+		# otherwise, python default text is "<stdin>"
+		s.set_file_name("-")
+
+
+	# Write results to all places specified
+	if True == args.digest_per_file:
+		s.digest_per_file()
+		written = True
+
+	if True == args.multiple_smokes:
+		s.smoke_per_file()
+		written = True
+
+	if True == args.smoke_file:
+		s.smoke_sums_filename = smoke_sums_fname
+		if 0 == files_hashed:
+			# If first hashed file, create blank hash destination files
+			s.create_empty_smoke_sums_digest_file()
+		s.write_to_smoke_sums_digest_file()
+		written = True
+
+	if True == args.multiple_sums_digests:
+		if 0 == files_hashed:
+			# If first hashed file, create blank hash destination files
+			s.create_empty_multiple_sums_digests()
+		s.multiple_sums_digests()
+		written = True
+
+	# if we have not written anywhere yet, then dump to stdout.  Plus, dump if also expicitly specified.
+	if False == written or True == args.stdout:
+		print s.single_line_digest()
+		written = True
+	
+	files_hashed = files_hashed + 1
